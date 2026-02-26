@@ -66,6 +66,18 @@ while cap.isOpened():
             cv2.polylines(frame, [left_eye_pts], True, color, 1)
             cv2.polylines(frame, [right_eye_pts], True, color, 1)
 
+            # --- Visual Mapping (Contours) ---
+            eye_color = (0, 255, 0) if ear >= EAR_THRESHOLD else (0, 0, 255)
+            # Mouth turns from Yellow to Orange-Red during a yawn
+            mouth_color = (0, 255, 255) if mar < MAR_THRESHOLD else (0, 165, 255)
+
+            # Draw Eye Contours
+            cv2.polylines(frame, [left_eye_pts], True, eye_color, 1)
+            cv2.polylines(frame, [right_eye_pts], True, eye_color, 1)
+
+            # Draw Mouth Contour (The missing piece!)
+            cv2.polylines(frame, [mouth_pts], True, mouth_color, 1)
+
             # --- Drowsiness/Yawn Logic ---
             if ear < EAR_THRESHOLD: 
                 EYE_COUNTER += 1
