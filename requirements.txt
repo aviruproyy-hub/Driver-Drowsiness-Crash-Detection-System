@@ -1,0 +1,11 @@
+# ADAS Driver Safety System — Python Dependencies
+# Install with:  pip install -r requirements.txt
+
+opencv-python>=4.8
+mediapipe>=0.10
+numpy>=1.24
+scipy>=1.11
+
+# Optional — only needed for real MPU-6050 IMU on Raspberry Pi / SBC
+# smbus2
+# mpu6050-raspberrypi
