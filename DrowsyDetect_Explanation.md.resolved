@@ -1,0 +1,612 @@
+# DrowsyDetect.py — Line-by-Line Explanation
+
+A complete walkthrough of the drowsiness detection module, organized section-by-section so every team member can understand the full working of the project.
+
+---
+
+## Table of Contents
+
+1. [Imports](#1-imports-lines-1-8)
+2. [Constants & Configuration](#2-constants--configuration-lines-10-29)
+3. [Core Algorithms](#3-core-algorithms-lines-32-46)
+4. [HUD Drawing Functions](#4-hud-drawing-functions-lines-49-145)
+5. [Setup & State Initialization](#5-setup--state-initialization-lines-148-176)
+6. [Main Loop — Frame Capture](#6-main-loop--frame-capture-lines-178-186)
+7. [No Face Handling](#7-no-face-handling-lines-193-197)
+8. [Face Detected — Landmark Extraction](#8-face-detected--landmark-extraction-lines-199-210)
+9. [Dynamic Calibration Phase](#9-dynamic-calibration-phase-lines-212-246)
+10. [PERCLOS Calculation](#10-perclos-calculation-lines-248-256)
+11. [Blink Counting](#11-blink-counting-lines-258-261)
+12. [Face Contour Drawing](#12-face-contour-drawing-lines-263-268)
+13. [Drowsiness Detection Logic](#13-drowsiness-detection-logic-lines-270-275)
+14. [Yawn Detection Logic](#14-yawn-detection-logic-lines-277-283)
+15. [Status Determination & Alerts](#15-status-determination--alerts-lines-285-316)
+16. [HUD Rendering & Display](#16-hud-rendering--display-lines-318-334)
+17. [Cleanup](#17-cleanup-lines-336-337)
+18. [System Flow Diagram](#18-system-flow-diagram)
+
+---
+
+## 1. Imports (Lines 1–8)
+
+```python
+import cv2                                  # Line 1
+import mediapipe as mp                      # Line 2
+import numpy as np                          # Line 3
+from scipy.spatial import distance as dist  # Line 4
+import winsound                             # Line 5
+import threading                            # Line 6
+import time                                 # Line 7
+from collections import deque               # Line 8
+```
+
+| Library | Purpose |
+|---|---|
+| **cv2** (OpenCV) | Captures webcam video, draws on frames, displays the window |
+| **mediapipe** | Google's ML library — provides the Face Mesh model that detects 468 facial landmarks in real-time |
+| **numpy** | Numerical operations — used to convert landmark coordinates into arrays |
+| **scipy.spatial.distance** | Provides `euclidean()` to calculate the straight-line distance between two points |
+| **winsound** | Windows-only module to play system beep sounds for alerts |
+| **threading** | Runs audio alerts on a separate thread so beeps don't freeze the video feed |
+| **time** | Timestamps for calibration, PERCLOS window, and session timer |
+| **deque** | Double-ended queue — efficient for the rolling PERCLOS window (fast append/pop from both ends) |
+
+---
+
+## 2. Constants & Configuration (Lines 10–29)
+
+### Landmark Indices (Lines 10–13)
+```python
+LEFT_EYE = [362, 385, 387, 263, 373, 380]   # Line 11
+RIGHT_EYE = [33, 160, 158, 133, 153, 144]   # Line 12
+MOUTH = [13, 14, 78, 308]                   # Line 13
+```
+
+MediaPipe's Face Mesh assigns a unique index (0–467) to each point on the face. These lists pick out the **6 key points around each eye** and the **4 key points of the mouth** needed for EAR and MAR calculations.
+
+**Eye landmark layout** (the 6 points form an ellipse around the eye):
+```
+        1
+   ___________
+  /     |      \
+ 0 ---- + ---- 3    (horizontal axis)
+  \_____|______/
+   5          4
+        2
+```
+- Points 1–2, 4–5 = vertical distances
+- Points 0–3 = horizontal distance
+
+**Mouth landmark layout:**
+- Point 0 = top lip center, Point 1 = bottom lip center → vertical opening
+- Point 2 = left corner, Point 3 = right corner → horizontal width
+
+### Thresholds (Lines 15–29)
+
+```python
+MAR_THRESHOLD = 0.5           # Line 16  — mouth aspect ratio above this = yawning
+FRAME_CHECK = 20              # Line 17  — consecutive "closed" frames to trigger DROWSY alert
+
+CALIBRATION_DURATION = 5      # Line 20  — seconds to calibrate
+EAR_CALIBRATION_FACTOR = 0.75 # Line 21  — threshold = baseline × 0.75
+EAR_MIN_THRESHOLD = 0.12      # Line 22  — absolute minimum EAR threshold (safety floor)
+
+PERCLOS_WINDOW_S = 30         # Line 25  — rolling 30-second window for PERCLOS
+PERCLOS_ALERT = 0.25          # Line 26  — 25% eye closure over 30s = FATIGUED
+
+PANEL_W = 210                 # Line 29  — width in pixels of the left-side HUD panel
+```
+
+> [!NOTE]
+> The EAR threshold is **not hardcoded** — it is dynamically computed during the calibration phase (see Section 9). `EAR_MIN_THRESHOLD` is a safety floor so the threshold never drops unreasonably low.
+
+---
+
+## 3. Core Algorithms (Lines 32–46)
+
+### calculate_EAR — Eye Aspect Ratio (Lines 32–36)
+
+```python
+def calculate_EAR(eye_points):
+    v1 = dist.euclidean(eye_points[1], eye_points[5])  # vertical distance 1
+    v2 = dist.euclidean(eye_points[2], eye_points[4])  # vertical distance 2
+    h  = dist.euclidean(eye_points[0], eye_points[3])  # horizontal distance
+    return (v1 + v2) / (2.0 * h) if h > 0 else 0.0
+```
+
+**What it does:** Measures how "open" the eye is.
+
+**Formula:**
+
+$$EAR = \frac{|P_1 - P_5| + |P_2 - P_4|}{2 \times |P_0 - P_3|}$$
+
+- **Eyes wide open** → EAR ≈ 0.25–0.35 (vertical distances are large relative to horizontal)
+- **Eyes closed** → EAR drops toward 0 (vertical distances shrink to nearly zero)
+- The `if h > 0` guard prevents a division-by-zero crash
+
+Both eyes' EAR values are averaged later (line 209) for a more stable reading.
+
+---
+
+### calculate_MAR — Mouth Aspect Ratio (Lines 39–42)
+
+```python
+def calculate_MAR(mouth_points):
+    v = dist.euclidean(mouth_points[0], mouth_points[1])  # vertical (lip opening)
+    h = dist.euclidean(mouth_points[2], mouth_points[3])  # horizontal (mouth width)
+    return v / h if h > 0 else 0.0
+```
+
+**What it does:** Measures how "open" the mouth is.
+
+$$MAR = \frac{\text{vertical lip distance}}{\text{horizontal mouth width}}$$
+
+- **Mouth closed** → MAR ≈ 0.1–0.3
+- **Yawning** → MAR jumps above 0.5 (the threshold)
+
+---
+
+### play_sound (Lines 45–46)
+
+```python
+def play_sound(frequency, duration):
+    threading.Thread(target=winsound.Beep, args=(frequency, duration), daemon=True).start()
+```
+
+Plays a Windows beep at the given `frequency` (Hz) for `duration` (ms). It runs on a **daemon thread** so the beep doesn't block/freeze the video feed. `daemon=True` means the thread dies automatically when the program exits.
+
+---
+
+## 4. HUD Drawing Functions (Lines 49–145)
+
+These functions draw the on-screen dashboard. They only **modify pixel data in the frame** — they don't affect any detection logic.
+
+### draw_metric_bar (Lines 49–60)
+
+```python
+def draw_metric_bar(frame, label, value, max_val, x, y, w, color):
+```
+
+Draws a small horizontal progress bar:
+1. **Line 51:** Calculates what fraction of the bar to fill (capped at 1.0)
+2. **Line 54:** Draws a dark grey background track
+3. **Line 57:** Draws the colored filled portion on top
+4. **Line 59:** Prints the label and numeric value above the bar (e.g., `EAR: 0.28`)
+
+---
+
+### draw_status_badge (Lines 63–80)
+
+```python
+def draw_status_badge(frame, status, x, y, w):
+```
+
+Draws a colored rectangle at the bottom of the HUD panel with the current status text centered inside it.
+
+| Status | Color |
+|---|---|
+| AWAKE | Green |
+| DROWSY | Red |
+| FATIGUED | Orange-Red |
+| YAWNING | Orange |
+| NO FACE | Grey |
+| CALIBRATING | Teal |
+
+**Lines 77–78** use `cv2.getTextSize()` to measure the text width so it can be perfectly centered inside the badge.
+
+---
+
+### draw_calib_progress (Lines 83–102)
+
+```python
+def draw_calib_progress(frame, fraction):
+```
+
+During the 5-second calibration, this draws:
+1. A **progress bar** in the center of the screen that fills from 0% to 100%
+2. The text `"Calibrating... XX%"` above it
+3. The instruction `"Look at the camera with eyes open"` below it
+
+---
+
+### draw_hud (Lines 105–145)
+
+```python
+def draw_hud(frame, stats):
+```
+
+The main dashboard renderer. It draws a **translucent dark panel** on the left side of the frame:
+
+1. **Lines 111–113:** Creates a semi-transparent overlay. `cv2.addWeighted` blends the dark rectangle with the original frame at 60/40 opacity — so the camera feed is still slightly visible through the panel.
+2. **Lines 116–118:** Draws the title "DRIVER MONITOR" with a teal accent line below it.
+3. **Lines 120–128:** Draws two metric bars:
+   - **EAR bar** — green when above threshold, red when below
+   - **PERCLOS bar** — green when below 25%, red when above
+4. **Lines 130–142:** Prints three text stats: Yawn count, Blink count, Session time
+5. **Line 145:** Draws the status badge at the bottom of the panel
+
+---
+
+## 5. Setup & State Initialization (Lines 148–176)
+
+### MediaPipe & Camera (Lines 148–151)
+
+```python
+mp_face_mesh = mp.solutions.face_mesh
+face_mesh = mp_face_mesh.FaceMesh(refine_landmarks=True)
+cap = cv2.VideoCapture(1)
+```
+
+- Creates the Face Mesh model with `refine_landmarks=True` (enables the extra iris landmarks for higher accuracy).
+- Opens the webcam at index `1`. Change to `0` if you only have one camera.
+
+### Calibration State (Lines 153–157)
+
+```python
+calib_values = []        # collects EAR samples during calibration
+calib_start = time.time()
+calibrated = False
+EAR_THRESHOLD = None     # will be set after calibration completes
+```
+
+### Detection State (Lines 159–171)
+
+```python
+EYE_COUNTER = 0          # counts consecutive "eyes closed" frames
+YAWN_COUNT = 0           # total yawns detected this session
+YAWN_COOLDOWN = False    # prevents counting the same yawn multiple times
+YAWN_ALERT_DONE = False  # prevents repeated beeps for the same yawn burst
+
+perclos_deque = deque()  # rolling buffer: stores (timestamp, is_closed) tuples
+perclos_val = 0.0        # current PERCLOS value (0.0 to 1.0)
+
+total_blinks = 0         # counts closed→open transitions
+prev_eye_closed = False  # tracks previous frame's eye state for edge detection
+
+session_start = time.time()  # when monitoring started — used for elapsed timer
+```
+
+---
+
+## 6. Main Loop — Frame Capture (Lines 178–186)
+
+```python
+while cap.isOpened():
+    success, frame = cap.read()     # grab one frame from webcam
+    if not success:
+        break                       # camera disconnected or error
+    frame = cv2.flip(frame, 1)      # mirror horizontally (driver-facing)
+    now = time.time()               # timestamp for this frame
+    h, w, _ = frame.shape           # frame dimensions
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)   # OpenCV uses BGR, MediaPipe needs RGB
+    results = face_mesh.process(rgb_frame)               # run face mesh detection
+```
+
+**Key point:** `face_mesh.process()` is the ML inference call. It returns detected face landmarks (or `None` if no face is found). This is the most computationally expensive line in each iteration.
+
+---
+
+## 7. No Face Handling (Lines 193–197)
+
+```python
+if not face_found:
+    status = "NO FACE"
+    cv2.putText(frame, "No face detected", ...)
+```
+
+If MediaPipe doesn't find a face in the frame:
+- Status is set to `"NO FACE"` (grey badge)
+- A warning message is drawn in the center of the screen
+- **All detection logic is skipped** — the program just shows the HUD and moves to the next frame
+
+---
+
+## 8. Face Detected — Landmark Extraction (Lines 199–210)
+
+```python
+for face_landmarks in results.multi_face_landmarks:
+    landmarks = np.array([
+        np.multiply([p.x, p.y], [w, h]).astype(int)
+        for p in face_landmarks.landmark
+    ])
+```
+
+**What this does:**
+1. MediaPipe returns landmarks as **normalized coordinates** (0.0 to 1.0 for both x and y).
+2. We multiply by `[w, h]` (frame width and height) to convert them to **pixel coordinates**.
+3. `.astype(int)` rounds to whole pixels.
+4. Result: a NumPy array of shape `(468, 2)` — every facial landmark as `[x, y]` in pixels.
+
+```python
+left_eye_pts  = landmarks[LEFT_EYE]    # 6 points around left eye
+right_eye_pts = landmarks[RIGHT_EYE]   # 6 points around right eye
+mouth_pts     = landmarks[MOUTH]       # 4 points of the mouth
+
+ear = (calculate_EAR(left_eye_pts) + calculate_EAR(right_eye_pts)) / 2.0
+mar = calculate_MAR(mouth_pts)
+```
+
+The EAR is averaged across both eyes for stability — one eye might be partially occluded or affected by lighting.
+
+---
+
+## 9. Dynamic Calibration Phase (Lines 212–246)
+
+> [!IMPORTANT]
+> This runs **only during the first 5 seconds**. Once calibration is complete, this entire block is skipped for the rest of the session.
+
+```python
+if not calibrated:
+    elapsed_c = now - calib_start
+    progress = min(elapsed_c / CALIBRATION_DURATION, 1.0)
+```
+
+### During the 5 seconds (Lines 217–220):
+```python
+if elapsed_c < CALIBRATION_DURATION:
+    calib_values.append(ear)          # collect the EAR reading
+    status = "CALIBRATING"
+    draw_calib_progress(frame, progress)  # show progress bar
+```
+
+Every frame, the current EAR value is saved into `calib_values`.
+
+### After 5 seconds (Lines 221–234):
+```python
+else:
+    if len(calib_values) < 5:
+        # Not enough data — face wasn't visible long enough
+        calib_values = []
+        calib_start = now               # restart calibration
+    else:
+        baseline_ear = float(np.mean(calib_values))   # average of all samples
+        EAR_THRESHOLD = max(baseline_ear * EAR_CALIBRATION_FACTOR,
+                            EAR_MIN_THRESHOLD)
+        calibrated = True
+```
+
+**The calibration formula:**
+
+$$\text{threshold} = \max(\text{baseline} \times 0.75, \;\; 0.12)$$
+
+- `baseline` = the average EAR when the driver's eyes are naturally open
+- `× 0.75` = the threshold is set at 75% of the baseline, meaning if the EAR drops to 75% of normal, eyes are considered "closing"
+- `max(..., 0.12)` = a safety floor so the threshold is never absurdly low
+
+**Example:** If baseline EAR = 0.257, then threshold = max(0.257 × 0.75, 0.12) = max(0.193, 0.12) = **0.193**
+
+### Skip detection during calibration (Lines 236–245):
+```python
+draw_hud(frame, { ... placeholder values ... })
+cv2.imshow('ADAS - Driver Monitor Pro', frame)
+if cv2.waitKey(1) & 0xFF == ord('q'):
+    break
+continue       # <--- skips all detection logic below, goes to next frame
+```
+
+The `continue` statement is critical — it means no drowsiness/yawn detection runs until calibration is done.
+
+---
+
+## 10. PERCLOS Calculation (Lines 248–256)
+
+**PERCLOS** = **PER**centage of eye **CLOS**ure over a rolling time window.
+
+```python
+is_closed = ear < EAR_THRESHOLD         # Line 248: is the eye closed right now?
+
+perclos_deque.append((now, is_closed))   # Line 251: record this frame's state
+
+# Line 253: remove entries older than 30 seconds
+while perclos_deque and (now - perclos_deque[0][0]) > PERCLOS_WINDOW_S:
+    perclos_deque.popleft()
+
+# Line 256: calculate the ratio
+if perclos_deque:
+    perclos_val = sum(1 for _, c in perclos_deque if c) / len(perclos_deque)
+```
+
+**How it works:**
+1. Each frame adds a `(timestamp, True/False)` entry to the deque
+2. Old entries (>30s ago) are removed from the front
+3. PERCLOS = count of `True` entries ÷ total entries
+
+**Example:** If 200 frames were captured in the last 30 seconds and eyes were closed in 60 of them:
+$$\text{PERCLOS} = \frac{60}{200} = 0.30 \;(30\%)$$
+
+Since 30% > 25% threshold → status becomes **"FATIGUED"**
+
+---
+
+## 11. Blink Counting (Lines 258–261)
+
+```python
+if prev_eye_closed and not is_closed:   # transition from closed → open
+    total_blinks += 1
+prev_eye_closed = is_closed
+```
+
+This uses **edge detection** — a blink is counted only when the eye transitions from closed to open (the "trailing edge" of a blink). This prevents counting each frame of a closed eye as a separate blink.
+
+---
+
+## 12. Face Contour Drawing (Lines 263–268)
+
+```python
+eye_color = (0, 255, 0) if ear >= EAR_THRESHOLD else (0, 0, 255)
+mouth_color = (0, 255, 255) if mar < MAR_THRESHOLD else (0, 165, 255)
+cv2.polylines(frame, [left_eye_pts], True, eye_color, 1)
+cv2.polylines(frame, [right_eye_pts], True, eye_color, 1)
+cv2.polylines(frame, [mouth_pts], True, mouth_color, 1)
+```
+
+Draws colored outlines around the eyes and mouth on the video feed:
+- **Eyes:** Green when open, Red when closed
+- **Mouth:** Yellow when closed, Orange when yawning
+
+`cv2.polylines(..., True, ...)` — the `True` means "close the polygon" (connect the last point back to the first).
+
+---
+
+## 13. Drowsiness Detection Logic (Lines 270–275)
+
+```python
+if is_closed:
+    EYE_COUNTER += 1         # eyes closed → increment counter
+else:
+    if EYE_COUNTER > 0:
+        EYE_COUNTER -= 1     # eyes open → slowly decrement
+```
+
+This is a **leaky integrator** pattern:
+- Each frame where eyes are closed adds +1
+- Each frame where eyes are open subtracts 1 (but never below 0)
+- When the counter reaches `FRAME_CHECK` (20), the driver is declared DROWSY
+
+**Why not just reset to 0?** The gradual decrement provides **hysteresis** — a single-frame glitch where the eyes appear open won't immediately cancel the drowsy state. The counter has to "drain" back down.
+
+---
+
+## 14. Yawn Detection Logic (Lines 277–283)
+
+```python
+if mar > MAR_THRESHOLD:
+    if not YAWN_COOLDOWN:
+        YAWN_COUNT += 1       # count this as a new yawn
+        YAWN_COOLDOWN = True  # prevent double-counting
+else:
+    YAWN_COOLDOWN = False     # mouth closed → reset cooldown
+```
+
+**YAWN_COOLDOWN** is a simple edge-detection flag:
+- When the mouth first opens past the threshold → count 1 yawn, set cooldown
+- While the mouth stays open → cooldown is `True`, so no more counting
+- When the mouth closes → cooldown resets
+- Next time it opens → counts as a new yawn
+
+---
+
+## 15. Status Determination & Alerts (Lines 285–316)
+
+### Priority-based status (Lines 285–305)
+
+```python
+fill_level = min(EYE_COUNTER / FRAME_CHECK, 1.0)   # 0.0 to 1.0
+```
+
+Status is assigned with **highest priority first**:
+
+| Priority | Condition | Status |
+|---|---|---|
+| 1 (highest) | `fill_level >= 1.0` (eyes closed for 20+ frames) | **DROWSY** |
+| 2 | `perclos_val >= 0.25` (25%+ closure over 30s) | **FATIGUED** |
+| 3 | `mar > 0.5` (mouth open) | **YAWNING** |
+| 4 (default) | None of the above | **AWAKE** |
+
+### DROWSY alert (Lines 288–299)
+
+When drowsy:
+1. **Line 290–291:** Plays a 1000 Hz beep for 3 seconds (only on the exact frame the counter hits 20, not every subsequent frame)
+2. **Lines 293–295:** Overlays a **red flash** on the entire screen using alpha blending (18% red, 82% original)
+3. **Lines 297–299:** Shows `"WAKE UP! PULL OVER"` in large red text at screen center
+
+### Yawn burst alert (Lines 307–316)
+
+```python
+if YAWN_COUNT > 0 and YAWN_COUNT % 3 == 0:
+    if not YAWN_ALERT_DONE:
+        play_sound(500, 5000)       # lower pitch, 5-second beep
+        YAWN_ALERT_DONE = True
+    cv2.putText(frame, "3 YAWNS: TAKE A BREAK", ...)
+else:
+    YAWN_ALERT_DONE = False
+```
+
+Every 3rd yawn (3, 6, 9, …), a 500 Hz beep plays and a yellow warning appears. `YAWN_ALERT_DONE` prevents the beep from replaying every frame while the count is still a multiple of 3.
+
+---
+
+## 16. HUD Rendering & Display (Lines 318–334)
+
+```python
+elapsed = now - session_start
+elapsed_str = time.strftime("%M:%S", time.gmtime(elapsed))   # e.g. "03:42"
+
+draw_hud(frame, {
+    "ear": ear,                          # current EAR value
+    "perclos": perclos_val,              # current PERCLOS percentage
+    "yawns": YAWN_COUNT,                 # total yawns this session
+    "blinks": total_blinks,             # total blinks this session
+    "elapsed_str": elapsed_str,         # session duration
+    "status": status,                   # AWAKE / DROWSY / FATIGUED / YAWNING / NO FACE
+    "ear_thresh": EAR_THRESHOLD or 0.22,  # calibrated threshold (fallback 0.22)
+})
+
+cv2.imshow('ADAS - Driver Monitor Pro', frame)   # display the final frame
+if cv2.waitKey(1) & 0xFF == ord('q'):             # press 'q' to quit
+    break
+```
+
+`cv2.waitKey(1)` waits 1 millisecond for a keypress — this also controls the frame rate. The `& 0xFF` is a bitmask needed on some platforms to correctly read the key code.
+
+---
+
+## 17. Cleanup (Lines 336–337)
+
+```python
+cap.release()              # release the webcam
+cv2.destroyAllWindows()    # close the display window
+```
+
+---
+
+## 18. System Flow Diagram
+
+```mermaid
+flowchart TD
+    A["Start Program"] --> B["Open Webcam & Initialize MediaPipe"]
+    B --> C["Begin Calibration (5 seconds)"]
+    C --> D{"Face Detected?"}
+    D -- No --> E["Show 'No Face' warning"] --> C
+    D -- Yes --> F["Collect EAR samples"]
+    F --> G{"5 seconds elapsed?"}
+    G -- No --> C
+    G -- Yes --> H["Compute baseline EAR\nthreshold = max(baseline × 0.75, 0.12)"]
+    H --> I["=== MAIN MONITORING LOOP ==="]
+    
+    I --> J["Capture Frame → Detect Face"]
+    J --> K{"Face Found?"}
+    K -- No --> L["Status = NO FACE"] --> V
+    K -- Yes --> M["Calculate EAR & MAR"]
+    
+    M --> N["Update PERCLOS (30s rolling window)"]
+    N --> O["Count Blinks (closed→open edges)"]
+    O --> P{"EYE_COUNTER ≥ 20?"}
+    P -- Yes --> Q["Status = DROWSY\nRed flash + Beep alert"]
+    P -- No --> R{"PERCLOS ≥ 25%?"}
+    R -- Yes --> S["Status = FATIGUED"]
+    R -- No --> T{"MAR > 0.5?"}
+    T -- Yes --> U["Status = YAWNING\n(count yawns, burst alert every 3)"]
+    T -- No --> V["Status = AWAKE"]
+    
+    Q & S & U & V --> W["Draw HUD Panel + Face Contours"]
+    W --> X["Display Frame"]
+    X --> Y{"'q' pressed?"}
+    Y -- No --> J
+    Y -- Yes --> Z["Release Camera & Exit"]
+```
+
+---
+
+## Quick Reference — Key Variables
+
+| Variable | Type | Purpose |
+|---|---|---|
+| `EAR_THRESHOLD` | `float` | Dynamically set during calibration. EAR below this = eyes "closed" |
+| `MAR_THRESHOLD` | `float` | Fixed at 0.5. MAR above this = mouth open (yawning) |
+| `EYE_COUNTER` | `int` | Leaky integrator: +1 when closed, −1 when open. Hits 20 = DROWSY |
+| `perclos_deque` | `deque` | Rolling 30s buffer of (timestamp, is_closed) tuples |
+| `perclos_val` | `float` | Current PERCLOS ratio (0.0–1.0). ≥0.25 = FATIGUED |
+| `total_blinks` | `int` | Counts closed→open transitions |
+| `YAWN_COUNT` | `int` | Total yawns detected this session |
+| `YAWN_COOLDOWN` | `bool` | Prevents counting the same yawn event twice |
