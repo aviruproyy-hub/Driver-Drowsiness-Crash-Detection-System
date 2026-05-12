@@ -11,7 +11,6 @@ import math
 import platform
 import datetime
 import os
-USE_REAL_IMU = False
 CRASH_G_THRESHOLD = 2.5
 ALERT_COOLDOWN_S = 5
 IMU_SAMPLE_RATE = 50
@@ -30,25 +29,6 @@ def play_sound(frequency: int, duration_ms: int) -> None:
             except:
                 print("\a", end="", flush=True)
     threading.Thread(target=_beep, daemon=True).start()
-class MPU6050:
-    ADDR = 0x68
-    PWR_MGMT_1 = 0x6B
-    ACCEL_XOUT_H = 0x3B
-    ACCEL_SCALE = 16384.0
-    def __init__(self):
-        import smbus2
-        self.bus = smbus2.SMBus(1)
-        self.bus.write_byte_data(self.ADDR, self.PWR_MGMT_1, 0)
-    def _read_word_2c(self, reg: int) -> int:
-        hi = self.bus.read_byte_data(self.ADDR, reg)
-        lo = self.bus.read_byte_data(self.ADDR, reg + 1)
-        val = (hi << 8) + lo
-        return val - 65536 if val >= 0x8000 else val
-    def get_accel_g(self):
-        ax = self._read_word_2c(self.ACCEL_XOUT_H) / self.ACCEL_SCALE
-        ay = self._read_word_2c(self.ACCEL_XOUT_H + 2) / self.ACCEL_SCALE
-        az = self._read_word_2c(self.ACCEL_XOUT_H + 4) / self.ACCEL_SCALE
-        return ax, ay, az
 class SimulatedIMU:
     def __init__(self):
         self._crash_flag = False
@@ -129,16 +109,8 @@ def draw_history_graph(frame, history: list, x: int, y: int, gw: int, gh: int, t
         cv2.line(frame, pts[i - 1], pts[i], color, 2)
     cv2.putText(frame, "G-FORCE HISTORY", (x + gw // 2 - 70, y + 18), cv2.FONT_HERSHEY_DUPLEX, 0.5, (130, 130, 130), 1)
 def main():
-    if USE_REAL_IMU:
-        try:
-            imu = MPU6050()
-            print("[CrashDetect] MPU-6050 connected.")
-        except Exception as e:
-            print(f"[CrashDetect] Init failed: {e}. Using simulation.")
-            imu = SimulatedIMU()
-    else:
-        imu = SimulatedIMU()
-        print("[CrashDetect] SIMULATION mode. SPACE=crash, Q=quit, C=cancel")
+    imu = SimulatedIMU()
+    print("[CrashDetect] SIMULATION mode. SPACE=crash, Q=quit, C=cancel")
     g_history = []
     crash_detected = False
     crash_msg = ""
@@ -187,8 +159,7 @@ def main():
         cv2.rectangle(frame, (0, DASH_H - 55), (DASH_W, DASH_H), (20, 20, 25), -1)
         cv2.line(frame, (0, DASH_H - 55), (DASH_W, DASH_H - 55), (50, 50, 55), 1)
         cv2.putText(frame, f"Crashes: {crash_count}", (20, DASH_H - 25), cv2.FONT_HERSHEY_DUPLEX, 0.55, (180, 180, 180), 1)
-        mode_txt = "REAL IMU" if USE_REAL_IMU else "SIM MODE"
-        cv2.putText(frame, mode_txt, (DASH_W - 200, DASH_H - 25), cv2.FONT_HERSHEY_DUPLEX, 0.5, (80, 80, 80), 1)
+        cv2.putText(frame, "SIM MODE", (DASH_W - 200, DASH_H - 25), cv2.FONT_HERSHEY_DUPLEX, 0.5, (80, 80, 80), 1)
 
         if crash_detected and not alert_cancelled:
             overlay = frame.copy()

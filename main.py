@@ -4,10 +4,9 @@ import cv2, numpy as np
 from scipy.spatial import distance as dist
 import mediapipe as mp
 from mediapipe.tasks.python.core.base_options import BaseOptions
-from mediapipe.tasks.python.vision.face_landmarker import FaceLandmarker, FaceLandmarkerOptions, FaceLandmarkerResult
+from mediapipe.tasks.python.vision.face_landmarker import FaceLandmarker, FaceLandmarkerOptions
 from mediapipe.tasks.python.vision.core.vision_task_running_mode import VisionTaskRunningMode
 from mediapipe.tasks.python.vision.core.image import Image as MpImage
-from mediapipe.tasks.python.vision.core.image_processing_options import ImageProcessingOptions
 
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_landmarker.task")
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
@@ -53,12 +52,10 @@ def calculate_MAR(pts):
     return v / h if h > 0 else 0.0
 _latest_result = None
 _result_lock = threading.Lock()
-_latest_ts = 0
-def _on_result(result: FaceLandmarkerResult, output_image: MpImage, ts: int):
-    global _latest_result, _latest_ts
+def _on_result(result, output_image, ts: int):
+    global _latest_result
     with _result_lock:
         _latest_result = result
-        _latest_ts = ts
 crash_alert_active = False
 crash_alert_msg = ""
 crash_alert_lock = threading.Lock()
@@ -110,7 +107,6 @@ YAWN_COUNT = 0
 YAWN_COOLDOWN = False
 YAWN_ALERT_DONE = False
 SESSION_START = time.time()
-frame_index = 0
 print("[Drowsiness] Running. Press Q to quit.")
 while cap.isOpened():
     ok, frame = cap.read()
